@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+Escaneo CVE por VERSION (un solo archivo, sin framework) -- monitor NVD LOCAL.
+
+Pide los dominios por consola (uno solo, o varios con coma/espacio). Por cada uno:
+IP, SSL, tecnologias+version con Wappalyzer (modo rapido, sin navegador), y los CVE
+que apliquen buscando POR VERSION contra un indice LOCAL construido desde el espejo
+NVD en bloque (fkie-cad/nvd-json-data-feeds): se baja TODA la base una sola vez y
+despues solo se actualizan los CVE nuevos/modificados (delta). NO usa la API de NVD,
+asi que no hay rate-limit. Enriquece con CISA KEV (fue explotado activamente, con
+fecha) y EPSS (probabilidad de explotacion) -> el historial de "que tan fuerte fue".
+Imprime el resultado en pantalla (CMD) y ademas genera un Excel.
+
+    python escaneo.py
+    python escaneo.py  example.com, www.example.org, example.net
+
+La 1a vez baja ~107 MB (por anios) y construye el indice (tarda unos minutos).
+Luego cada corrida solo baja el delta (~10 MB) si hay cambios.
+
+    pip install wappalyzer openpyxl requests     (lzma es parte de Python)
+"""
+import os, re, sys, json, time, ssl, socket, gzip, lzma, requests, openpyxl
+from datetime import datetime
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from wappalyzer import analyze
+
+# -- CONFIG --------------------------------------------------------------------
+AQUI      = os.path.dirname(os.path.abspath(__file__))
+NVD_DIR   = os.path.join(AQUI, "nvd_cache")
+INDEX_FILE= os.path.join(NVD_DIR, "nvd_index.json")
+STATE_FILE= os.path.join(NVD_DIR, "nvd_state.json")
+FEEDS_DIR = os.path.join(AQUI, "feeds_cache")
+WORKERS   = 10
+SCAN_TYPE = "fast"     # fast = solo HTTP (rapido). balanced/full abren navegador (lento).
+TIMEOUT   = 25
+CONSULTAR_FEEDS = True  # KEV + EPSS. Ponlo en False si no los quieres.
+
+REL_BASE  = "https://github.com/fkie-cad/nvd-json-data-feeds/releases/latest/download"
+REL_API   = "https://api.github.com/repos/fkie-cad/nvd-json-data-feeds/releases/latest"
+ANIO_INI  = 1999
+KEV_URL   = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EPSS_URL  = "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
+UA        = {"User-Agent": "Scanner/3.0"}
+
+ORDEN = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0}
+def sev_max(cves): return max(cves, key=lambda c: ORDEN.get(c["severity"], 0))["severity"] if cves else "LIMPIO"
+def norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def pv(v):
+    n = re.findall(r"\d+", str(v)) if v else []
+    return tuple(int(x) for x in n[:4]) if n else None
+def vcmp(a, b):
+    if a is None or b is None: return 0
+    la, lb = list(a)+[0]*(4-len(a)), list(b)+[0]*(4-len(b))
+    return (la > lb) - (la < lb)
+
+# -- CPE: nombre de tecnologia (Wappalyzer) -> vendor:producto del CPE de NVD --
+# clave normalizada con norm(); desambigua productos homonimos por vendor.
+CPE_MAP = {
+    "php": "php:php", "python": "python:python", "ruby": "ruby-lang:ruby",
+    "nodejs": "nodejs:node.js", "perl": "perl:perl",
+    "nginx": "f5:nginx", "openresty": "openresty:openresty",
+    "apachehttpserver": "apache:http_server", "apache": "apache:http_server",
+    "microsoftiis": "microsoft:internet_information_services", "iis": "microsoft:internet_information_services",
+    "apachetomcat": "apache:tomcat", "tomcat": "apache:tomcat",
+    "litespeed": "litespeed_technologies:litespeed_web_server",
+    "wordpress": "wordpress:wordpress", "drupal": "drupal:drupal", "joomla": "joomla:joomla",
+    "magento": "magento:magento", "woocommerce": "woocommerce:woocommerce",
+    "laravel": "laravel:laravel", "symfony": "sensiolabs:symfony", "codeigniter": "codeigniter:codeigniter",
+    "django": "djangoproject:django", "rubyonrails": "rubyonrails:ruby_on_rails",
+    "springframework": "vmware:spring_framework", "express": "openjsf:express",
+    "nextjs": "vercel:next.js", "nuxtjs": "nuxt:nuxt",
+    "jquery": "jquery:jquery", "jqueryui": "jqueryui:jquery_ui",
+    "react": "facebook:react", "vuejs": "vuejs:vue.js", "angular": "google:angular",
+    "bootstrap": "getbootstrap:bootstrap", "lodash": "lodash:lodash", "momentjs": "momentjs:moment",
+    "axios": "axios:axios", "chartjs": "chartjs:chart.js", "swiper": "idangero.us:swiper",
+    "mysql": "mysql:mysql", "mariadb": "mariadb:mariadb", "postgresql": "postgresql:postgresql",
+    "mongodb": "mongodb:mongodb", "redis": "redis:redis", "sqlite": "sqlite:sqlite",
+    "microsoftsqlserver": "microsoft:sql_server",
+    "openssl": "openssl:openssl", "openssh": "openbsd:openssh",
+    "elasticsearch": "elastic:elasticsearch", "docker": "docker:docker",
+    "kubernetes": "kubernetes:kubernetes", "jenkins": "jenkins:jenkins",
+    "gitlab": "gitlab:gitlab", "grafana": "grafana:grafana",
+    "java": "oracle:jdk", "microsoftnet": "microsoft:.net_framework", "aspnet": "microsoft:asp.net",
+}
+
+# -- PARSEO NVD: un CVE -> (id, score, sev, {producto: [rangos]}) ---------------
+def parse_nvd(cve):
+    cid = cve.get("id")
+    if not cid: return None, None, "NONE", {}
+    score, sev = None, "NONE"
+    metrics = cve.get("metrics", {}) or {}
+    for k in ("cvssMetricV31", "cvssMetricV40", "cvssMetricV30", "cvssMetricV2"):
+        arr = metrics.get(k)
+        if arr:
+            m0 = arr[0]; cd = m0.get("cvssData", {})
+            score = cd.get("baseScore")
+            sev = (cd.get("baseSeverity") or m0.get("baseSeverity") or "NONE").upper()
+            break
+    prods = {}
+    for cfg in (cve.get("configurations") or []):
+        for node in (cfg.get("nodes") or []):
+            for cm in (node.get("cpeMatch") or []):
+                if not cm.get("vulnerable"): continue
+                crit = cm.get("criteria", "")
+                p = crit.split(":")
+                if len(p) < 6 or p[2] not in ("a", "o"): continue   # apps y SO; hardware no
+                vendor, product, ver = norm(p[3]), norm(p[4]), p[5]
+                if not product: continue
+                rng = {
+                    "ve": ver if ver not in ("*", "-", "") else None,  # version exacta en el CPE
+                    "si": cm.get("versionStartIncluding"), "se": cm.get("versionStartExcluding"),
+                    "ei": cm.get("versionEndIncluding"),   "ee": cm.get("versionEndExcluding"),
+                    "v":  vendor,
+                }
+                prods.setdefault(product, []).append(rng)
+    return cid, score, sev, prods
+
+def _indexar(index, cve):
+    cid, score, sev, prods = parse_nvd(cve)
+    if not cid: return
+    for prod, rangos in prods.items():
+        index.setdefault(prod, []).append({"cve": cid, "score": score, "sev": sev,
+                                           "v": rangos[0]["v"], "r": rangos})
+
+# -- MATCHING POR VERSION (contra rangos CPE) ----------------------------------
+def ver_en_rango(t, r):
+    if r.get("ve"):
+        return vcmp(t, pv(r["ve"])) == 0
+    ok = True
+    if r.get("si") is not None: ok = ok and vcmp(t, pv(r["si"])) >= 0
+    if r.get("se") is not None: ok = ok and vcmp(t, pv(r["se"])) > 0
+    if r.get("ei") is not None: ok = ok and vcmp(t, pv(r["ei"])) <= 0
+    if r.get("ee") is not None: ok = ok and vcmp(t, pv(r["ee"])) < 0
+    return ok   # cpe:producto:* sin cotas -> afecta todas las versiones (correcto en NVD)
+
+def match_cves(index, comp, version):
+    t = pv(version)
+    if not t: return []
+    vp = CPE_MAP.get(norm(comp))
+    if vp:
+        vend, prod = norm(vp.split(":", 1)[0]), norm(vp.split(":", 1)[1])
+    else:
+        vend, prod = None, norm(comp)
+    out, seen = [], set()
+    for e in index.get(prod, []):
+        if vend and e.get("v") and e["v"] != vend: continue   # desambigua por vendor si lo conocemos
+        if e["cve"] in seen: continue
+        if any(ver_en_rango(t, r) for r in e["r"]):
+            seen.add(e["cve"]); out.append({"id": e["cve"], "score": e["score"], "severity": e["sev"]})
+    return out
+
+def producto_cubierto(index, comp):
+    """True si el producto (via mapa o nombre directo) EXISTE en el indice NVD.
+    Si es False y el componente tiene version, no podemos afirmar que este limpio:
+    hay que revisarlo a mano o agregarlo al CPE_MAP (que no se pase ningun componente)."""
+    vp = CPE_MAP.get(norm(comp))
+    prod = norm(vp.split(":", 1)[1]) if vp else norm(comp)
+    return prod in index
+
+# -- MONITOR NVD LOCAL: construir (bulk por anios) / actualizar (delta) ---------
+def _bajar_feed(nombre):
+    """Baja y descomprime CVE-<nombre>.json.xz del release; devuelve lista cve_items."""
+    r = requests.get(f"{REL_BASE}/{nombre}.json.xz", timeout=600, headers=UA)
+    r.raise_for_status()
+    return json.loads(lzma.decompress(r.content)).get("cve_items", [])
+
+def _release_tag():
+    try: return requests.get(REL_API, timeout=30, headers={**UA, "Accept": "application/vnd.github+json"}).json().get("tag_name", "")
+    except Exception: return ""
+
+def build_full_index():
+    print("[Monitor] Construyendo indice NVD completo (solo la 1a vez, baja ~107MB por anios)...")
+    index = {}
+    for y in range(datetime.now().year, ANIO_INI - 1, -1):
+        try:
+            items = _bajar_feed(f"CVE-{y}")
+        except Exception as e:
+            print(f"[Monitor]   {y}: no disponible ({str(e)[:40]})"); continue
+        for cve in items: _indexar(index, cve)
+        print(f"[Monitor]   {y}: {len(items):6} CVE  (indice: {len(index)} productos)")
+    return index
+
+def actualizar_delta(index):
+    """Baja CVE-modified + CVE-recent y reemplaza esos CVE en el indice."""
+    try:
+        mods = _bajar_feed("CVE-modified") + _bajar_feed("CVE-recent")
+    except Exception as e:
+        print(f"[Monitor] sin Internet para delta ({str(e)[:40]}); uso el indice local."); return index, 0
+    cids = {c.get("id") for c in mods if c.get("id")}
+    if not cids:
+        print("[Monitor] al dia (sin cambios)."); return index, 0
+    # quita las entradas viejas de esos CVE (una pasada) y re-inserta
+    for prod in list(index):
+        index[prod] = [e for e in index[prod] if e["cve"] not in cids]
+    for cve in mods: _indexar(index, cve)
+    index = {p: lst for p, lst in index.items() if lst}
+    print(f"[Monitor] {len(cids)} CVE nuevos/modificados aplicados."); return index, len(cids)
+
+def cargar_monitor():
+    os.makedirs(NVD_DIR, exist_ok=True)
+    index, state = None, {}
+    if os.path.exists(INDEX_FILE):
+        print("[Monitor] cargando indice local...")
+        try:
+            index = json.load(open(INDEX_FILE, encoding="utf-8"))
+            state = json.load(open(STATE_FILE, encoding="utf-8")) if os.path.exists(STATE_FILE) else {}
+        except Exception: index = None
+    if index is None:
+        index = build_full_index()
+        index, _ = actualizar_delta(index)
+        cambios = True
+    else:
+        tag = _release_tag()
+        if tag and tag != state.get("tag"):
+            index, n = actualizar_delta(index); cambios = n > 0
+            state["tag"] = tag
+        else:
+            print("[Monitor] indice al dia (mismo release)."); cambios = False
+    if cambios or not os.path.exists(INDEX_FILE):
+        if not state.get("tag"): state["tag"] = _release_tag()
+        tmp = INDEX_FILE + ".tmp"; json.dump(index, open(tmp, "w", encoding="utf-8")); os.replace(tmp, INDEX_FILE)
+        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
+    print(f"[Monitor] {len(index)} productos en el indice.")
+    return index
+
+# -- FEEDS KEV + EPSS (opcionales, bajada 1 vez al dia, busqueda local) --------
+def _fresco(p): return os.path.exists(p) and (time.time() - os.path.getmtime(p)) < 86400
+def cargar_feeds():
+    if not CONSULTAR_FEEDS: return {}, {}
+    os.makedirs(FEEDS_DIR, exist_ok=True)
+    kev, epss = {}, {}
+    kf = os.path.join(FEEDS_DIR, "kev.json")
+    try:
+        if not _fresco(kf): open(kf, "w", encoding="utf-8").write(requests.get(KEV_URL, timeout=90, headers=UA).text)
+        for v in json.load(open(kf, encoding="utf-8")).get("vulnerabilities", []):
+            if v.get("cveID"): kev[v["cveID"].upper()] = {"fecha": v.get("dateAdded", ""),
+                                 "ransom": (v.get("knownRansomwareCampaignUse", "") or "").lower() == "known"}
+        print(f"[Feeds] CISA KEV: {len(kev)} CVE explotados activamente.")
+    except Exception as e: print(f"[Feeds] KEV n/d ({str(e)[:40]})")
+    ef = os.path.join(FEEDS_DIR, "epss.csv.gz")
+    try:
+        if not _fresco(ef): open(ef, "wb").write(requests.get(EPSS_URL, timeout=120, headers=UA).content)
+        with gzip.open(ef, "rt", encoding="utf-8") as f:
+            for ln in f:
+                if ln[:1] == "#" or ln.startswith("cve,"): continue
+                p = ln.strip().split(",")
+                if len(p) >= 3:
+                    try: epss[p[0].upper()] = (float(p[1]), float(p[2]))
+                    except ValueError: pass
+        print(f"[Feeds] EPSS: {len(epss)} CVE.")
+    except Exception as e: print(f"[Feeds] EPSS n/d ({str(e)[:40]})")
+    return kev, epss
+
+# -- IP / SSL ------------------------------------------------------------------
+def obtener_ip(h):
+    try: return socket.gethostbyname(h)
+    except Exception: return "N/D"
+def obtener_ssl(h, port=443, to=8):
+    try:
+        with socket.create_connection((h, port), timeout=to) as s:
+            with ssl.create_default_context().wrap_socket(s, server_hostname=h) as ss:
+                c = ss.getpeercert(); na = c.get("notAfter")
+                em = dict(x[0] for x in c.get("issuer", [])).get("organizationName", "")
+                if na:
+                    exp = datetime.strptime(na, "%b %d %H:%M:%S %Y %Z"); d = (exp - datetime.now()).days
+                    return f"{'Valido' if d>0 else 'EXPIRADO'} | vence {exp:%Y-%m-%d} ({d}d) | {em}"
+                return "Valido (sin fecha)"
+    except ssl.SSLCertVerificationError as e: return f"Cert invalido: {str(e)[:50]}"
+    except (socket.timeout, TimeoutError): return "Sin respuesta SSL (timeout)"
+    except (ConnectionRefusedError, OSError): return "Sin SSL (443 cerrado)"
+    except Exception as e: return f"Error SSL: {str(e)[:50]}"
+
+# -- ESCANEO DE UN DOMINIO (deteccion + match local, todo en el hilo) ----------
+def escanear(url, index, kev, epss, i, total):
+    t0 = time.time()
+    host = urlparse(url).hostname or url
+    ip, sslinfo = obtener_ip(host), obtener_ssl(host)
+    try:
+        techs = analyze(url=url, scan_type=SCAN_TYPE, timeout=TIMEOUT).get(url, {}) or {}
+    except Exception as e:
+        print(f"[{i:03d}/{total}] SIN RESPUESTA  {host}  ({str(e)[:40]})")
+        return {"url": url, "host": host, "ip": ip, "ssl": sslinfo, "comp": "Sin tecnologias",
+                "cves": [], "sev": "ERROR", "estado": f"Sin respuesta: {str(e)[:60]}", "techs": {}}
+    comp = ", ".join(f"{n}{(' '+d['version']) if isinstance(d, dict) and d.get('version') else ''}"
+                     for n, d in sorted(techs.items()))
+    cves, sin_cob = [], []
+    for n, d in techs.items():
+        ver = d.get("version") if isinstance(d, dict) else None
+        if not ver: continue   # sin version -> exento (no se puede afirmar vulnerable)
+        if not producto_cubierto(index, n):
+            sin_cob.append(f"{n} {ver}")   # producto no esta en NVD: NO se pasa callado, se avisa
+            continue
+        for c in match_cves(index, n, ver):
+            cid = c["id"].upper(); k = kev.get(cid); e = epss.get(cid)
+            cves.append({**c, "comp": f"{n} {ver}", "kev": bool(k),
+                         "kev_fecha": k["fecha"] if k else "", "ransom": k["ransom"] if k else False,
+                         "epss": round(e[0]*100, 2) if e else None})
+    cves.sort(key=lambda c: (c["kev"], ORDEN.get(c["severity"], 0), c["epss"] or 0), reverse=True)
+    sev = sev_max(cves) if techs else "ERROR"
+    estado = "OK" if techs else "Sin tecnologias"
+    if sin_cob: estado += f" | SIN COBERTURA: {len(sin_cob)} comp (revisar)"
+    print(f"[{i:03d}/{total}] {host:38} {ip:15} CVEs:{len(cves):3} KEV:{sum(c['kev'] for c in cves):2} s/cob:{len(sin_cob):2} [{sev}] ({round(time.time()-t0,1)}s)")
+    return {"url": url, "host": host, "ip": ip, "ssl": sslinfo, "comp": comp or "Sin tecnologias",
+            "cves": cves, "sin_cob": sin_cob, "sev": sev, "estado": estado, "techs": techs}
+
+# -- REPORTE EN PANTALLA (CMD) -------------------------------------------------
+def imprimir_reporte(filas):
+    print("\n" + "=" * 72 + "\n  RESULTADO POR DOMINIO\n" + "=" * 72)
+    for f in filas:
+        print(f"\n>> {f['host']}   [{f['ip']}]   -- {f['sev']}")
+        print(f"   SSL: {f['ssl']}")
+        print(f"   Componentes: {f['comp']}")
+        if f.get("sin_cob"):
+            print(f"   SIN COBERTURA (no estan en NVD, revisar a mano): {', '.join(f['sin_cob'])}")
+        if not f["cves"]:
+            print("   CVEs: (ninguno con version vulnerable conocida)")
+            continue
+        kevn = sum(c["kev"] for c in f["cves"])
+        print(f"   CVEs: {len(f['cves'])}  (KEV explotados: {kevn})")
+        for c in f["cves"]:
+            flags = (f" [KEV {c['kev_fecha'] or 'si'}]" if c["kev"] else "") + (" [RANSOMWARE]" if c.get("ransom") else "")
+            eps = f"  EPSS {c['epss']}%" if c["epss"] is not None else ""
+            sc = c.get("score"); sc = sc if sc is not None else "N/A"
+            print(f"     - {c['comp']:24} {c['id']:16} {c['severity']:8} CVSS {sc}{eps}{flags}")
+            print(f"         https://nvd.nist.gov/vuln/detail/{c['id']}")
+
+# -- EXCEL ---------------------------------------------------------------------
+def guardar_excel(filas):
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    COL = {"CRITICAL": "ff4444", "HIGH": "ff8c00", "MEDIUM": "ffd700", "LOW": "aaaaaa",
+           "LIMPIO": "d4edda", "ERROR": "f8d7da"}
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Escaneo"
+    heads = ["#", "Dominio", "IP", "SSL", "Componentes", "Severidad", "CVEs", "KEV",
+             "EPSS max %", "Detalle CVEs (id|sev|CVSS|KEV|EPSS%)", "Enlaces CVE (NVD)", "Estado"]
+    anchos = [5, 34, 15, 30, 40, 11, 7, 7, 10, 72, 50, 18]
+    for i, (h, w) in enumerate(zip(heads, anchos), 1):
+        c = ws.cell(1, i, h); c.fill = PatternFill("solid", fgColor="1a1a2e")
+        c.font = Font(color="FFFFFF", bold=True); c.alignment = Alignment(horizontal="center", wrap_text=True)
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"; bd = Border(*[Side(style="thin", color="dddddd")]*4)
+    for n, f in enumerate(filas, 1):
+        kevc = sum(c["kev"] for c in f["cves"]); eps = [c["epss"] for c in f["cves"] if c["epss"] is not None]
+        det = "\n".join(f"{c['comp']} {c['id']}|{c['severity']}|{c.get('score') if c.get('score') is not None else 'N/A'}"
+                        f"|{'KEV '+(c['kev_fecha'] or 'si') if c['kev'] else '-'}"
+                        f"|{str(c['epss'])+'%' if c['epss'] is not None else '-'}" for c in f["cves"])
+        enl = "\n".join(f"https://nvd.nist.gov/vuln/detail/{c['id']}" for c in f["cves"])
+        vals = [n, f["url"].replace("https://", "").replace("http://", ""), f["ip"], f["ssl"], f["comp"],
+                f["sev"], len(f["cves"]), kevc, max(eps) if eps else "-", det, enl, f["estado"]]
+        for i, v in enumerate(vals, 1):
+            c = ws.cell(n+1, i, v); c.border = bd; c.alignment = Alignment(vertical="top", wrap_text=True)
+            if i == 6: c.fill = PatternFill("solid", fgColor=COL.get(f["sev"], "ffffff")); c.font = Font(bold=True)
+            if i == 8 and kevc: c.fill = PatternFill("solid", fgColor="ff4444"); c.font = Font(color="FFFFFF", bold=True)
+    ruta = os.path.join(AQUI, f"escaneo_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    wb.save(ruta); return ruta
+
+# -- MAIN ----------------------------------------------------------------------
+def parse_dominios(texto):
+    vis, out = set(), []
+    # separa por coma, ; salto de linea, espacios o tabs (un host nunca lleva espacios)
+    for p in re.split(r"[,\s;]+", texto or ""):
+        d = p.strip().strip("/")
+        if not d: continue
+        if not d.lower().startswith("http"): d = "https://" + d   # sin esquema -> https; si trae http/https se respeta
+        if d not in vis: vis.add(d); out.append(d)
+    return out
+
+def main():
+    print("=" * 66 + "\n  Escaneo CVE por version (Wappalyzer " + SCAN_TYPE + " + indice NVD local + KEV/EPSS)\n" + "=" * 66)
+    index = cargar_monitor()
+    kev, epss = cargar_feeds()
+
+    arg = ",".join(sys.argv[1:]).strip()
+    if arg:
+        texto = arg
+    else:
+        print("\n  Que dominios quieres revisar sus vulnerabilidades?")
+        print("  Puede ser uno solo, o varios separados por coma (o espacio).")
+        print("  Ej:  example.com, www.example.org, example.net")
+        texto = input("\n  Dominios: ").strip()
+    dominios = parse_dominios(texto)
+    if not dominios:
+        print("  No se reconocio ningun dominio."); return
+    print(f"\n  {len(dominios)} dominios | {WORKERS} hilos | modo {SCAN_TYPE}\n" + "-" * 66)
+
+    filas = [None] * len(dominios)
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(escanear, u, index, kev, epss, i+1, len(dominios)): i for i, u in enumerate(dominios)}
+        for fu in as_completed(futs):
+            filas[futs[fu]] = fu.result()
+    filas = [x for x in filas if x]
+
+    imprimir_reporte(filas)
+    ruta = guardar_excel(filas)
+    con_cve = sum(1 for x in filas if x["cves"])
+    kevtot = sum(sum(c["kev"] for c in x["cves"]) for x in filas)
+    print("\n" + "-" * 66 + f"\n  Listo: {len(filas)} dominios, {con_cve} con CVEs, {kevtot} CVE en CISA KEV.")
+    print(f"  Excel: {ruta}")
+
+if __name__ == "__main__":
+    main()
+    # pip install wappalyzer openpyxl requests   (playwright NO hace falta en modo fast)
